@@ -22,7 +22,7 @@ required.
 Compile Instructions
 --------------------
 
-See INSTALL_LINUX or INSTALL_WINDOWS for compile instruuctions
+See INSTALL_LINUX or INSTALL_WINDOWS for compile instructions
 
 Requirements
 ------------
@@ -65,12 +65,44 @@ If not what makes it happen or not happen?
 Change Log
 ----------
 
+v3.20.0
+
+#375 Fixed segfault in algos using Groestl VAES due to use of uninitialized data.
+
+v3.19.9
+
+More Blake256, Blake512, Luffa & Cubehash prehash optimizations.
+Relaxed some excessively strict data alignment that was negatively affecting performance.
+
+v3.19.8
+
+#370 "stratum+ssl", in addition to "stratum+tcps", is now recognized as a valid
+url protocol specifier for requesting a secure stratum connection.
+
+The full url, including the protocol, is now displayed in the stratum connect
+log and the periodic summary log.
+
+Small optimizations to Cubehash, AVX2 & AVX512.
+
+Byte order and prehash optimizations for Blake256 & Blake512, AVX2 & AVX512.
+
+v3.19.7
+
+#369 Fixed time limited mining, --time-limit.
+Fixed a potential compile error when using optimization below -O3.
+
+v3.19.6
+
+#363 Fixed a stratum bug where the first job may be ignored delaying start of hashing
+Fixed handling of nonce exhaust when hashing a fast algo with extranonce disabled
+Small optimization to Shavite.
+
 v3.19.5
 
 Enhanced stratum-keepalive preemptively resets the stratum connection
 before the server to avoid lost shares.
 
-Added build-msys2.sh scrypt for easier compiling on Windows, see Wiki for details.
+Added build-msys2.sh shell script for easier compiling on Windows, see Wiki for details.
 
 X16RT: eliminate unnecessary recalculations of the hash order.
 

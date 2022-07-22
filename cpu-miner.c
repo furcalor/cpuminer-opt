@@ -105,8 +105,9 @@ bool opt_randomize = false;
 static int opt_retries = -1;
 static int opt_fail_pause = 10;
 static int opt_time_limit = 0;
+static unsigned int time_limit_stop = 0;
 int opt_timeout = 300;
-static int opt_scantime = 5;
+static int opt_scantime = 0;
 const int min_scantime = 1;
 //static const bool opt_time = true;
 enum algos opt_algo = ALGO_NULL;
@@ -341,6 +342,7 @@ void get_currentalgo(char* buf, int sz)
 
 void proper_exit(int reason)
 {
+   if (opt_debug) applog(LOG_INFO,"Program exit");
 #ifdef WIN32
 	if (opt_background) {
 		HWND hcon = GetConsoleWindow();
@@ -1097,7 +1099,7 @@ void report_summary_log( bool force )
    sprintf_et( et_str, et.tv_sec );
    sprintf_et( upt_str, uptime.tv_sec );
 
-   applog( LOG_BLUE, "%s: %s", algo_names[ opt_algo ], short_url );
+   applog( LOG_BLUE, "%s: %s", algo_names[ opt_algo ], rpc_url );
    applog2( LOG_NOTICE, "Periodic Report     %s        %s", et_str, upt_str );
    applog2( LOG_INFO, "Share rate        %.2f/min     %.2f/min",
             submit_rate, safe_div( (double)submitted_share_count*60.,
@@ -2201,8 +2203,6 @@ static void *miner_thread( void *userdata )
 //                      : 0;
    uint32_t end_nonce = 0xffffffffU / opt_n_threads  * (thr_id + 1) - 0x20;
 
-   time_t   firstwork_time = 0;
-   int  i;
    memset( &work, 0, sizeof(work) );
  
    /* Set worker threads to nice 19 and then preferentially to SCHED_IDLE
@@ -2246,7 +2246,7 @@ static void *miner_thread( void *userdata )
 
    if ( !algo_gate.miner_thread_init( thr_id ) )
    {
-      applog( LOG_ERR, "FAIL: thread %u failed to initialize", thr_id );
+      applog( LOG_ERR, "FAIL: thread %d failed to initialize", thr_id );
       exit (1);
    }
 
@@ -2274,22 +2274,34 @@ static void *miner_thread( void *userdata )
           {
              while ( unlikely( stratum_down ) )
                 sleep( 1 );
-             if ( *nonceptr >= end_nonce )
-                stratum_gen_work( &stratum, &g_work );
+             if ( unlikely( ( *nonceptr >= end_nonce )
+                         && !work_restart[thr_id].restart ) )
+             {
+                if ( opt_extranonce )
+                   stratum_gen_work( &stratum, &g_work );
+                else
+                {
+                   if ( !thr_id )
+                   {
+                      applog( LOG_WARNING, "nonce range exhausted, extranonce not subscribed" );
+                      applog( LOG_WARNING, "waiting for new work...");
+                   }
+                   while ( !work_restart[thr_id].restart )
+                      sleep ( 1 );
+                }
+             }
           }
-          else
+          else if ( !opt_benchmark ) // GBT or getwork
           {
              pthread_rwlock_wrlock( &g_work_lock );
 
-             if ( ( ( time(NULL) - g_work_time )
-                 >= ( have_longpoll ? LP_SCANTIME : opt_scantime ) )
+             if ( ( ( time(NULL) - g_work_time ) >= opt_scantime )
                || ( *nonceptr >= end_nonce ) )
              {
                 if ( unlikely( !get_work( mythr, &g_work ) ) )
                 {
                    pthread_rwlock_unlock( &g_work_lock );
-		             applog( LOG_ERR, "work retrieval failed, exiting "
-		                              "mining thread %d", thr_id );
+		             applog( LOG_ERR, "work retrieval failed, exiting miner thread %d", thr_id );
 		             goto out;
 	             }
                 g_work_time = time(NULL);
@@ -2312,25 +2324,14 @@ static void *miner_thread( void *userdata )
        if ( unlikely( !algo_gate.ready_to_mine( &work, &stratum, thr_id ) ) )
           continue;
 
-// LP_SCANTIME overrides opt_scantime option, is this right?
-
-       // adjust max_nonce to meet target scan time. Stratum and longpoll
-       // can go longer because they can rely on restart_threads to signal
-       // an early abort. get_work on the other hand can't rely on
-       // restart_threads so need a much shorter scantime
-       if ( have_stratum )
-          max64 = 60 * thr_hashrates[thr_id];
-       else if ( have_longpoll )
-          max64 = LP_SCANTIME * thr_hashrates[thr_id];
-       else  // getwork inline
-          max64 = opt_scantime * thr_hashrates[thr_id];   
+       // opt_scantime expressed in hashes
+       max64 = opt_scantime * thr_hashrates[thr_id];
 
        // time limit
-       if ( unlikely( opt_time_limit && firstwork_time ) )
+       if ( unlikely( opt_time_limit ) )
        {
-          int passed = (int)( time(NULL) - firstwork_time );
-          int remain = (int)( opt_time_limit - passed );
-          if ( remain < 0 )
+          unsigned int now = (unsigned int)time(NULL);
+          if ( now >= time_limit_stop )
           {
              if ( thr_id != 0 )
              {
@@ -2342,14 +2343,16 @@ static void *miner_thread( void *userdata )
                 char rate[32];
                 format_hashrate( global_hashrate, rate );
                 applog( LOG_NOTICE, "Benchmark: %s", rate );
-                fprintf(stderr, "%llu\n", (unsigned long long)global_hashrate);
              }
              else
-                applog( LOG_NOTICE,
-	          "Mining timeout of %ds reached, exiting...", opt_time_limit);
-	       proper_exit(0);
+                applog( LOG_NOTICE, "Mining timeout of %ds reached, exiting...",
+                        opt_time_limit);
+
+             proper_exit(0);
           }
-          if ( remain < max64 ) max64 = remain;
+          // else
+          if ( time_limit_stop - now < opt_scantime )
+              max64 = ( time_limit_stop - now ) * thr_hashrates[thr_id] ;
        }
 
        // Select nonce range based on max64, the estimated number of hashes
@@ -2365,8 +2368,6 @@ static void *miner_thread( void *userdata )
           max_nonce = work_nonce + (uint32_t)max64;
 
        // init time
-       if ( firstwork_time == 0 )
-          firstwork_time = time(NULL);
        hashes_done = 0;
        gettimeofday( (struct timeval *) &tv_start, NULL );
 
@@ -2439,7 +2440,7 @@ static void *miner_thread( void *userdata )
        {
           double hashrate  = 0.;
           pthread_mutex_lock( &stats_lock );
-          for ( i = 0; i < opt_n_threads; i++ )
+          for ( int i = 0; i < opt_n_threads; i++ )
               hashrate  += thr_hashrates[i];
           global_hashrate  = hashrate;
           pthread_mutex_unlock( &stats_lock );
@@ -2753,7 +2754,7 @@ static void *stratum_thread(void *userdata )
    stratum.url = (char*) tq_pop(mythr->q, NULL);
    if (!stratum.url)
       goto out;
-   applog( LOG_BLUE, "Stratum connect %s", short_url );
+   applog( LOG_BLUE, "Stratum connect %s", stratum.url );
 
    while (1)
    {
@@ -2805,14 +2806,10 @@ static void *stratum_thread(void *userdata )
          {
             stratum_down = false;
             applog(LOG_BLUE,"Stratum connection established" );
+            if ( stratum.new_job )   // prime first job
+               stratum_gen_work( &stratum, &g_work );
          }
       }
-
-//      report_summary_log( ( stratum_diff != stratum.job.diff )
-//                       && ( stratum_diff != 0. ) );
-      
-//      if ( stratum.new_job )
-//         stratum_gen_work( &stratum, &g_work );
 
       // Wait for new message from server
       if ( likely( stratum_socket_full( &stratum, opt_timeout ) ) )
@@ -3338,6 +3335,7 @@ void parse_arg(int key, char *arg )
 			if ( strncasecmp( arg, "http://", 7 )
            && strncasecmp( arg, "https://", 8 )
            && strncasecmp( arg, "stratum+tcp://", 14 )
+           && strncasecmp( arg, "stratum+ssl://", 14 )
            && strncasecmp( arg, "stratum+tcps://", 15 ) )
          {
             fprintf(stderr, "unknown protocol -- '%s'\n", arg);
@@ -3695,6 +3693,17 @@ int main(int argc, char *argv[])
       show_usage_and_exit(1);
    }
 
+   if ( !opt_scantime )
+   {
+      if      ( have_stratum )  opt_scantime = 30;
+      else if ( have_longpoll ) opt_scantime = LP_SCANTIME;
+      else                      opt_scantime = 5;
+   }
+
+   if ( opt_time_limit )
+      time_limit_stop = (unsigned int)time(NULL) + opt_time_limit;
+
+
    // need to register to get algo optimizations for cpu capabilities
    // but that causes registration logs before cpu capabilities is output.
    // Would need to split register function into 2 parts. First part sets algo
@@ -3760,6 +3769,7 @@ int main(int argc, char *argv[])
    flags = CURL_GLOBAL_ALL;
    if ( !opt_benchmark )
      if ( strncasecmp( rpc_url, "https:", 6 )
+       && strncasecmp( rpc_url, "stratum+ssl://", 14 )
        && strncasecmp( rpc_url, "stratum+tcps://", 15 ) )
          flags &= ~CURL_GLOBAL_SSL;
 
@@ -3902,6 +3912,8 @@ int main(int argc, char *argv[])
    {
       if ( opt_debug )
          applog(LOG_INFO,"Creating stratum thread");
+
+      stratum.new_job = false;  // just to make sure
 
       /* init stratum thread info */
 		stratum_thr_id = opt_n_threads + 2;

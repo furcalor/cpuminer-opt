@@ -15,13 +15,14 @@
 
 //  AVX512 intrinsics have a few changes from previous conventions.
 //
-//    cmp instruction now returns a bitmask isnstead of a vector mask.
+//    cmp instruction now returns a bitmask instead of a vector mask.
 //    This eliminates the need for the blendv instruction.
 //
 //    The new rotate instructions require the count to be an 8 bit
 //    immediate value only. Compilation fails if a variable is used.
 //    The documentation is the same as for shift and it works with
-//    variables.
+//    variables. The inconsistency is likely due to compiler optimizations
+//    that can eliminate the variable in some instances.
 //
 //    _mm512_permutex_epi64 only shuffles within 256 bit lanes. Permute
 //    usually shuffles accross all lanes.
@@ -317,6 +318,9 @@ static inline void memcpy_512( __m512i *dst, const __m512i *src, const int n )
 // AVX512F has built-in fixed and variable bit rotation for 64 & 32 bit
 // elements and can be called directly. But they only accept immediate 8
 // for control arg. 
+// The workaround is a fraud, just a fluke of the compiler's optimizer.
+// It fails without -O3. The compiler seems to unroll shift loops, eliminating
+// the variable control, better than rotate loops. 
 //
 // _mm512_rol_epi64,  _mm512_ror_epi64,  _mm512_rol_epi32,  _mm512_ror_epi32
 // _mm512_rolv_epi64, _mm512_rorv_epi64, _mm512_rolv_epi32, _mm512_rorv_epi32
@@ -429,21 +433,9 @@ static inline __m512i mm512_rol_16( const __m512i v, const int c )
   casti_m512i( d, 7 ) = _mm512_shuffle_epi8( casti_m512i( s, 7 ), ctl ); \
 } while(0)
 
-//
-// Shift with zero fill & shuffle-rotate elements in 512 bit vector.
-//
 
-// rename plan change ror to vror for Vector ROtate Right,
-// and vrol for Vector ROtate Left, not to be confused with
-//variable rotate rorv, rolv,
-// Plan changed, use shuflr & shufll instead symbolizing a shuffle-rotate
-// operation. 1xNN notaion ia also removed and replaced with simpler NN.
-// Swap will still have its own mnemonic and will be aliased as both
-// left and right shuffles.
-
-// Shift elements right or left in 512 bit vector, filling with zeros.
-// Multiple element shifts can be combined into a single larger
-// element shift.
+// Cross-lane shuffles implementing rotate & shift of elements within a vector.
+//
 
 #define mm512_shiftr_256( v ) \
   _mm512_alignr_epi64( _mm512_setzero, v, 4 )
@@ -493,7 +485,7 @@ static inline __m512i mm512_shufll_32( const __m512i v )
 static inline __m512i mm512_shuflr_x64( const __m512i v, const int n )
 { return _mm512_alignr_epi64( v, v, n ); }
 
-static inline __m512i mm512_shufll_x32( const __m512i v, const int n )
+static inline __m512i mm512_shuflr_x32( const __m512i v, const int n )
 { return _mm512_alignr_epi32( v, v, n ); }
 
 #define mm512_shuflr_16( v ) \
@@ -529,7 +521,7 @@ static inline __m512i mm512_shufll_x32( const __m512i v, const int n )
 // 128 bit lane shift is handled by bslli bsrli.
 
 // Swap hi & lo 128 bits in each 256 bit lane
-#define mm512_swap256_128( v )   _mm512_permutex_epi64( v, 0x4e )
+#define mm512_swap256_128( v )      _mm512_permutex_epi64( v, 0x4e )
 #define mm512_shuflr256_128 mm512_swap256_128
 #define mm512_shufll256_128 mm512_swap256_128
 
@@ -581,8 +573,19 @@ static inline __m512i mm512_shufll_x32( const __m512i v, const int n )
                      0x0e0d0c0b0a090807, 0x060504030201001f ) )
 
 //
-// Shuffle-roate elements within 128 bit lanes of 512 bit vector.
+// Shuffle/rotate elements within 128 bit lanes of 512 bit vector.
  
+// Limited 2 input, 1 output shuffle, combines shuffle with blend.
+// Like most shuffles it's limited to 128 bit lanes and like some shuffles
+// destination elements must come from a specific source. 
+#define mm512_shuffle2_64( a, b, c ) \
+   _mm512_castpd_si512( _mm512_shuffle_pd( _mm512_castsi512_pd( a ), \
+                                           _mm512_castsi512_pd( b ), c ) ); 
+
+#define mm512_shuffle2_32( a, b, c ) \
+   _mm512_castps_si512( _mm512_shuffle_ps( _mm512_castsi512_ps( a ), \
+                                           _mm512_castsi512_ps( b ), c ) ); 
+
 // Swap 64 bits in each 128 bit lane
 #define mm512_swap128_64( v )   _mm512_shuffle_epi32( v, 0x4e )
 #define mm512_shuflr128_64  mm512_swap128_64
@@ -610,11 +613,8 @@ static inline __m512i mm512_shuflr128_8( const __m512i v, const int c )
 // shufl2r is 2 input ...
 // Drop macros? They can easilly be rebuilt using shufl2 functions
 
-// Shuffle concatenated { v1, v2 ) right or left by 256 bits and return
-// rotated v1 
-// visually confusing for shif2r because of arg order. First arg is always
-// the target for modification, either update by reference or by function
-// return.
+// 2 input, 1 output
+// Rotate concatenated { v1, v2 ) right or left and return v1. 
 #define mm512_shufl2r_256( v1, v2 )    _mm512_alignr_epi64( v2, v1, 4 )
 #define mm512_shufl2l_256( v1, v2 )    _mm512_alignr_epi64( v1, v2, 4 )
 
@@ -626,77 +626,6 @@ static inline __m512i mm512_shuflr128_8( const __m512i v, const int c )
 
 #define mm512_shufl2r_32( v1, v2 )     _mm512_alignr_epi32( v2, v1, 1 )
 #define mm512_shufl2l_32( v1, v2 )     _mm512_alignr_epi32( v1, v2, 1 )
-
-// Rotate elements from 2 512 bit vectors in place, source arguments
-//  are overwritten.
-
-#define mm512_swap1024_512( v1, v2 ) \
-   v1 = _mm512_xor_si512( v1, v2 ); \
-   v2 = _mm512_xor_si512( v1, v2 ); \
-   v1 = _mm512_xor_si512( v1, v2 );
-#define mm512_shufl2l_512 mm512_swap1024_512 \
-#define mm512_shufl2r_512 mm512_swap1024_512 \
-
-// Deprecated, will be removed. Use shufl2 functions instead. Leave them as is
-// for now.
-//  Rotate elements from 2 512 bit vectors in place, both source arguments
-//  are updated.
-
-#define mm512_vror1024_256( v1, v2 ) \
-do { \
-   __m512i t = _mm512_alignr_epi64( v1, v2, 4 ); \
-   v1 = _mm512_alignr_epi64( v2, v1, 4 ); \
-   v2 = t; \
-} while(0)
-
-#define mm512_vrol1024_256( v1, v2 ) \
-do { \
-   __m512i t = _mm512_alignr_epi64( v1, v2, 4 ); \
-   v2 = _mm512_alignr_epi64( v2, v1, 4 ); \
-   v1 = t; \
-} while(0)
-
-#define mm512_vror1024_128( v1, v2 ) \
-do { \
-   __m512i t = _mm512_alignr_epi64( v1, v2, 2 ); \
-   v1 = _mm512_alignr_epi64( v2, v1, 2 ); \
-   v2 = t; \
-} while(0)
-
-#define mm512_vrol1024_128( v1, v2 ) \
-do { \
-   __m512i t = _mm512_alignr_epi64( v1, v2, 6 ); \
-   v2 = _mm512_alignr_epi64( v2, v1, 6 ); \
-   v1 = t; \
-} while(0)
-
-#define mm512_vror1024_64( v1, v2 ) \
-do { \
-   __m512i t = _mm512_alignr_epi64( v1, v2, 1 ); \
-   v1 = _mm512_alignr_epi64( v2, v1, 1 ); \
-   v2 = t; \
-} while(0)
-
-#define mm512_vrol1024_64( v1, v2 ) \
-do { \
-   __m512i t = _mm512_alignr_epi64( v1, v2, 7 ); \
-   v2 = _mm512_alignr_epi64( v2, v1, 7 ); \
-   v1 = t; \
-} while(0)
-
-#define mm512_vror1024_32( v1, v2 ) \
-do { \
-   __m512i t = _mm512_alignr_epi32( v1, v2, 1 ); \
-   v1 = _mm512_alignr_epi32( v2, v1, 1 ); \
-   v2 = t; \
-} while(0)
-
-#define mm512_vrol1024_32( v1, v2 ) \
-do { \
-   __m512i t = _mm512_alignr_epi32( v1, v2, 15 ); \
-   v2 = _mm512_alignr_epi32( v2, v1, 15 ); \
-   v1 = t; \
-} while(0)
 
 #endif // AVX512
 #endif // SIMD_512_H__
